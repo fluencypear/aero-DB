@@ -442,7 +442,7 @@ def main():
     try:
         server = AppServer((bind_host, configured_port), Handler)
     except OSError:
-        p.exit(1, '服务监听失败，请检查 AERO_APP_BIND_HOST / AERO_APP_PORT 和端口占用。\\n')
+        p.exit(1, '服务监听失败，请检查 AERO_APP_BIND_HOST / AERO_APP_PORT 和端口占用。\n')
     display_host = bind_host if bind_host not in ('0.0.0.0', '::') else '127.0.0.1'
     url = 'http://' + display_host + ':' + str(server.server_port) + '/?login=1'
     print('Aero strategy knowledge workbench: ' + url)
