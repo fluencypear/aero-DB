@@ -1,0 +1,2 @@
+# Install from an approved offline wheelhouse; no internet access is required at runtime.
+PyMySQL>=1.1,<2
