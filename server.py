@@ -309,7 +309,7 @@ class Handler(BaseHTTPRequestHandler):
         if path in ('/', '/index.html', '/web/index.html'):
             index = BASE / 'index.html'
             if not index.is_file(): index = BASE / 'web' / 'index.html'
-            raw = index.read_text(encoding='utf-8').replace('SQLite · 本机数据库', DB_LABEL).encode('utf-8')
+            raw = index.read_text(encoding='utf-8').replace('数据库类型由服务端配置', DB_LABEL).encode('utf-8')
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
             self.send_header('Content-Length', str(len(raw)))
