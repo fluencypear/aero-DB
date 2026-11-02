@@ -508,36 +508,31 @@ class Handler(BaseHTTPRequestHandler):
                     asset_id = asset.get('id')
                     if asset_id in submitted: raise ValueError('资产编号重复')
                     submitted[asset_id] = asset
-                if path == '/api/restore':
-                    for asset in state['assets']:
-                        asset.setdefault('owner', '待指定')
-                        enrich_asset(asset)
-                else:
-                    merged_assets = []
-                    for asset_id, asset in submitted.items():
-                        prior = existing.get(asset_id)
-                        if prior:
-                            canonical_prior = dict(prior)
-                            enrich_asset(canonical_prior)
-                            if canonical_prior['owner'] != user:
-                                if json.dumps(asset, ensure_ascii=False, sort_keys=True) != json.dumps(canonical_prior, ensure_ascii=False, sort_keys=True):
-                                    return self.reply(403, {'error': '只能修改或删除自己负责的素材'})
-                                merged_assets.append(canonical_prior)
-                            else:
-                                asset['owner'] = user
-                                enrich_asset(asset)
-                                merged_assets.append(asset)
+                merged_assets = []
+                for asset_id, asset in submitted.items():
+                    prior = existing.get(asset_id)
+                    if prior:
+                        canonical_prior = dict(prior)
+                        enrich_asset(canonical_prior)
+                        if canonical_prior['owner'] != user:
+                            if json.dumps(asset, ensure_ascii=False, sort_keys=True) != json.dumps(canonical_prior, ensure_ascii=False, sort_keys=True):
+                                return self.reply(403, {'error': '只能修改或删除自己负责的素材'})
+                            merged_assets.append(canonical_prior)
                         else:
                             asset['owner'] = user
                             enrich_asset(asset)
                             merged_assets.append(asset)
-                    for asset_id, prior in existing.items():
-                        if asset_id in submitted: continue
-                        canonical_prior = dict(prior)
-                        enrich_asset(canonical_prior)
-                        if canonical_prior['owner'] != user:
-                            merged_assets.append(canonical_prior)
-                    state['assets'] = merged_assets
+                    else:
+                        asset['owner'] = user
+                        enrich_asset(asset)
+                        merged_assets.append(asset)
+                for asset_id, prior in existing.items():
+                    if asset_id in submitted: continue
+                    canonical_prior = dict(prior)
+                    enrich_asset(canonical_prior)
+                    if canonical_prior['owner'] != user:
+                        merged_assets.append(canonical_prior)
+                state['assets'] = merged_assets
                 validate(state)
                 c.execute('INSERT INTO history(created,body) VALUES(?,?)',(datetime.now().isoformat(),json.dumps(old,ensure_ascii=False)))
                 write_state(c,state)
