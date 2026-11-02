@@ -438,7 +438,7 @@ def main():
     try:
         initialize()
     except Exception as error:
-        p.exit(1, str(error) + '\\n')
+        p.exit(1, str(error) + '\n')
     try:
         server = AppServer((bind_host, configured_port), Handler)
     except OSError:
