@@ -24,6 +24,9 @@ if DB_BACKEND not in ('sqlite', 'postgresql', 'mysql'):
 DB = Path(os.environ.get('AERO_SQLITE_PATH', str(BASE / 'data' / 'knowledge.db')))
 DB_LABEL = {'sqlite': 'SQLite · 本机数据库', 'postgresql': 'PostgreSQL · 内网数据库', 'mysql': 'MySQL · 内网数据库'}[DB_BACKEND]
 TOKEN = secrets.token_urlsafe(32)
+APP_PUBLIC_SCHEME = os.environ.get('AERO_APP_PUBLIC_SCHEME', 'http').strip().lower()
+if APP_PUBLIC_SCHEME not in ('http', 'https'):
+    raise RuntimeError('AERO_APP_PUBLIC_SCHEME must be http or https')
 
 class DatabaseError(RuntimeError):
     pass
@@ -350,7 +353,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self.allowed_host(): return self.reply(403, {'error': '仅允许本机访问'})
         origin = self.headers.get('Origin')
-        if origin and origin != 'http://' + self.headers.get('Host', ''):
+        if origin and origin != APP_PUBLIC_SCHEME + '://' + self.headers.get('Host', ''):
             return self.reply(403, {'error': '请求来源无效'})
         path = urlparse(self.path).path
         if path not in ('/api/login', '/api/logout', '/api/state', '/api/tag', '/api/csv/preview', '/api/restore'):
@@ -381,11 +384,11 @@ class Handler(BaseHTTPRequestHandler):
                     self.server.sessions = {k:v for k,v in self.server.sessions.items() if v['expires'] > now}
                     self.server.sessions.pop(self.session_id(), None)
                     self.server.sessions[sid] = {'user': row[0], 'expires': now + 12*60*60}
-                cookie = self.cookie_name() + '=' + sid + '; HttpOnly; SameSite=Strict; Path=/'
+                cookie = self.cookie_name() + '=' + sid + '; HttpOnly; SameSite=Strict; Path=/' + ('; Secure' if APP_PUBLIC_SCHEME == 'https' else '')
                 return self.reply(200, {'user': row[0], 'token': TOKEN}, cookie)
             if path == '/api/logout':
                 with self.server.session_lock: self.server.sessions.pop(self.session_id(), None)
-                return self.reply(200, {'logged_out': True}, self.cookie_name() + '=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0')
+                return self.reply(200, {'logged_out': True}, self.cookie_name() + '=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0' + ('; Secure' if APP_PUBLIC_SCHEME == 'https' else ''))
             if path == '/api/csv/preview':
                 if not isinstance(state, dict): raise ValueError('CSV格式错误')
                 with connect() as c:
