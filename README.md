@@ -36,6 +36,7 @@ PostgreSQL 使用 psycopg 3（也兼容 psycopg2）；MySQL 使用 PyMySQL。驱
 | `AERO_DB_PASSWORD` | 应用专用数据库密码 | 由管理员配置 |
 | `AERO_APP_BIND_HOST` | 应用监听地址；本机演示默认127.0.0.1，内网共享可设为0.0.0.0 | `0.0.0.0` |
 | `AERO_APP_PORT` | 应用服务端口，默认8000 | `8000` |
+| `AERO_APP_PUBLIC_SCHEME` | 浏览器实际使用的协议；HTTPS反向代理后设为 `https` | `https` |
 | `AERO_ALLOWED_HOSTS` | 浏览器访问应用时使用的主机名/IP，逗号分隔 | `10.20.1.20,kb.intra.example` |
 | `AERO_ADMIN_INITIAL_PASSWORD` | 外部数据库首次初始化时创建本地admin账号的初始密码 | 由管理员配置 |
 | `AERO_LOAD_SEED` | 外部数据库是否载入演示素材；默认不载入 | `1` |
@@ -58,7 +59,7 @@ $env:AERO_ADMIN_INITIAL_PASSWORD = "<首次初始化用的强密码>"
 py -3 server.py --no-browser
 ```
 
-正式环境将 `AERO_DB_BACKEND` 改为 `mysql`，数据库地址、库名、账号和密码使用正式环境配置。客户端使用 `http://应用服务器内网地址:8000` 访问；防火墙只需允许客户端访问应用端口，并允许应用服务器访问数据库端口。
+正式环境将 `AERO_DB_BACKEND` 改为 `mysql`，数据库地址、库名、账号和密码使用正式环境配置。客户端使用应用服务器内网地址访问；防火墙只需允许客户端访问应用端口，并允许应用服务器访问数据库端口。生产环境建议由内网 HTTPS 反向代理终止 TLS，并设置 `AERO_APP_PUBLIC_SCHEME=https`；程序会据此校验请求来源并设置 Secure 登录 Cookie。不要将应用或数据库端口发布到互联网。
 
 `AERO_ADMIN_INITIAL_PASSWORD` 只在目标数据库尚无 `admin` 用户时生效。当前版本沿用原有单一 admin 登录方式，尚未提供用户管理、角色权限或企业统一认证；多人共用前应由项目管理员评估账号与授权需求。
 
