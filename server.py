@@ -1,4 +1,4 @@
-"""Offline strategy knowledge workbench. Python 3.8+, standard library only."""
+"""Offline/intranet knowledge workbench. Python 3.8+; external DB backends need a driver."""
 import argparse
 import csv
 import io
