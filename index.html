@@ -253,7 +253,7 @@ function restoreFile(){
  };input.click();
 }
 
-Object.assign(window,{downloadCsvTemplate,importCsv,previewCsv,applyCsv,login,confirmLogin,logout,refreshTag,backup,card,detail,download,edit,generate,go,ingest,list,modal,newTemplate,optim,opts,readFile,render,restoreFile,saveEdit,saveTpl,search,setfilter,split,title,toast,toggle,deleteAsset,removePart,updatePart,suggestPartTag,sendChatMessage,updateReportDraft,addAccount,saveNewAccount,resetAccount,deleteAccount,getAgentPayload});
+Object.assign(window,{downloadCsvTemplate,importCsv,previewCsv,applyCsv,login,confirmLogin,logout,refreshTag,backup,card,detail,download,edit,generate,go,ingest,list,modal,newTemplate,optim,opts,readFile,render,restoreFile,saveEdit,saveTpl,search,setfilter,split,title,toast,toggle,deleteAsset,removePart,updatePart,suggestPartTag,sendChatMessage,updateReportDraft,openGenerationRecord,addAccount,saveNewAccount,resetAccount,deleteAccount,getAgentPayload});
 for(const [k,g,s]of [['selected',()=>selected,v=>selected=v],['draft',()=>draft,v=>draft=v]])Object.defineProperty(window,k,{get:g,set:s});
 login();
 if(location.protocol==='file:'){
