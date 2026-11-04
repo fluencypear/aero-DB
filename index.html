@@ -153,7 +153,7 @@ async function generate(){
  const topic=document.querySelector('#topic').value.trim();if(!topic)return toast('请先填写工作事项');
  const t=templates[document.querySelector('#tpl').value],req=document.querySelector('#req').value.trim(),audience=document.querySelector('#aud').value;
  const ids=[...document.querySelectorAll('[name=ref]:checked')].map(x=>Number(x.value)),rr=records.filter(r=>ids.includes(r.id)&&r.status==='已审核');
- draft=`${topic}\\n（规则生成草稿 · 需人工复核）\\n\\n研究目的\\n面向${audience}，围绕“${topic}”开展研究。\\n产出要求：${req||'待补充具体研究问题、范围及篇幅要求。'}\\n\\n报告框架\\n${t.outline}\\n\\n可引用的证据素材\\n${rr.length?rr.map(r=>`[K-${r.id}] ${r.title}\\n${r.content}\\n来源：${r.source}；更新：${r.date}`).join('\\n\\n'):'暂无已审核素材，请补充可信资料。'}\\n\\n研究缺口与下一步\\n1. 核验素材与本课题的相关性，补充适用范围。\\n2. 补充具体企业事实、统计数据与原文出处。\\n3. 围绕章节形成论证，明确结论、适用条件和建议。\\n4. 未审核素材不纳入正文；本草稿不构成研究结论。`;
+ draft=`${topic}\n（规则生成草稿 · 需人工复核）\n\n研究目的\n面向${audience}，围绕“${topic}”开展研究。\n产出要求：${req||'待补充具体研究问题、范围及篇幅要求。'}\n\n报告框架\n${t.outline}\n\n可引用的证据素材\n${rr.length?rr.map(r=>`[K-${r.id}] ${r.title}\n${r.content}\n来源：${r.source}；更新：${r.date}`).join('\n\n'):'暂无已审核素材，请补充可信资料。'}\n\n研究缺口与下一步\n1. 核验素材与本课题的相关性，补充适用范围。\n2. 补充具体企业事实、统计数据与原文出处。\n3. 围绕章节形成论证，明确结论、适用条件和建议。\n4. 未审核素材不纳入正文；本草稿不构成研究结论。`;
  agentContext={topic,audience,requirements:req,template:{name:t.name,outline:t.outline,scenario:t.scenario||'',content_tags:t.content_tags||[]},evidence:rr.map(r=>({id:r.id,title:r.title,content:r.content,source:r.source,domain:r.domain,type:r.type,date:r.date})),reportDraft:draft};
  agentMessages=[{role:'assistant',content:draft}];
  page=6;render();toast('草稿已生成，已进入独立对话页面');
