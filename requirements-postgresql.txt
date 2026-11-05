@@ -1,0 +1,2 @@
+# Install from an approved offline wheelhouse; no internet access is required at runtime.
+psycopg[binary]>=3.1,<4

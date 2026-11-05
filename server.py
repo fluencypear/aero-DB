@@ -1,4 +1,4 @@
-"""Offline strategy knowledge workbench. Python 3.8+, standard library only."""
+"""Offline/intranet knowledge workbench. Python 3.8+; external DB backends need a driver."""
 import argparse
 import csv
 import io
@@ -8,6 +8,7 @@ from http.cookies import SimpleCookie, CookieError
 import time
 import json
 import sqlite3
+import os
 import secrets
 import threading
 import webbrowser
@@ -17,8 +18,49 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 BASE = Path(__file__).resolve().parent
-DB = BASE / 'data' / 'knowledge.db'
+DB_BACKEND = os.environ.get('AERO_DB_BACKEND', 'sqlite').strip().lower()
+if DB_BACKEND not in ('sqlite', 'postgresql', 'mysql'):
+    raise RuntimeError('AERO_DB_BACKEND must be sqlite, postgresql, or mysql')
+DB = Path(os.environ.get('AERO_SQLITE_PATH', str(BASE / 'data' / 'knowledge.db')))
+DB_LABEL = {'sqlite': 'SQLite · 本机数据库', 'postgresql': 'PostgreSQL · 内网数据库', 'mysql': 'MySQL · 内网数据库'}[DB_BACKEND]
 TOKEN = secrets.token_urlsafe(32)
+APP_PUBLIC_SCHEME = os.environ.get('AERO_APP_PUBLIC_SCHEME', 'http').strip().lower()
+if APP_PUBLIC_SCHEME not in ('http', 'https'):
+    raise RuntimeError('AERO_APP_PUBLIC_SCHEME must be http or https')
+
+class DatabaseError(RuntimeError):
+    pass
+
+class DBConnection:
+    def __init__(self, raw, backend):
+        self.raw, self.backend = raw, backend
+    def __enter__(self):
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            self.raw.commit() if exc_type is None else self.raw.rollback()
+        finally:
+            self.raw.close()
+    def execute(self, sql, params=()):
+        try:
+            if self.backend == 'sqlite': return self.raw.execute(sql, params)
+            cursor = self.raw.cursor()
+            cursor.execute(sql.replace('?', '%s'), params)
+            return cursor
+        except Exception as error:
+            raise DatabaseError('数据库操作失败，请检查数据库配置和服务状态') from error
+    def executemany(self, sql, rows):
+        try:
+            if self.backend == 'sqlite': return self.raw.executemany(sql, rows)
+            cursor = self.raw.cursor()
+            cursor.executemany(sql.replace('?', '%s'), rows)
+            return cursor
+        except Exception as error:
+            raise DatabaseError('数据库批量写入失败，请检查数据库配置') from error
+    def executescript(self, script):
+        if self.backend != 'sqlite': raise DatabaseError('executescript 仅用于 SQLite')
+        try: return self.raw.executescript(script)
+        except Exception as error: raise DatabaseError('SQLite 初始化失败') from error
 
 TAG_RULES = [
     ('组织绩效', ('绩效', '组织', '职责')),
@@ -117,34 +159,116 @@ def enrich_asset(asset):
 
 
 def connect():
-    c = sqlite3.connect(str(DB), timeout=10)
-    c.execute('PRAGMA foreign_keys=ON')
-    return c
+    try:
+        if DB_BACKEND == 'sqlite':
+            DB.parent.mkdir(parents=True, exist_ok=True)
+            raw = sqlite3.connect(str(DB), timeout=10)
+            raw.execute('PRAGMA foreign_keys=ON')
+        elif DB_BACKEND == 'postgresql':
+            try:
+                import psycopg
+                raw = psycopg.connect(host=os.environ.get('AERO_DB_HOST', '127.0.0.1'),
+                    port=int(os.environ.get('AERO_DB_PORT', '5432')), dbname=os.environ['AERO_DB_NAME'],
+                    user=os.environ['AERO_DB_USER'], password=os.environ['AERO_DB_PASSWORD'], connect_timeout=10)
+            except ImportError:
+                import psycopg2
+                raw = psycopg2.connect(host=os.environ.get('AERO_DB_HOST', '127.0.0.1'),
+                    port=int(os.environ.get('AERO_DB_PORT', '5432')), dbname=os.environ['AERO_DB_NAME'],
+                    user=os.environ['AERO_DB_USER'], password=os.environ['AERO_DB_PASSWORD'], connect_timeout=10)
+        else:
+            import pymysql
+            raw = pymysql.connect(host=os.environ.get('AERO_DB_HOST', '127.0.0.1'),
+                port=int(os.environ.get('AERO_DB_PORT', '3306')), database=os.environ['AERO_DB_NAME'],
+                user=os.environ['AERO_DB_USER'], password=os.environ['AERO_DB_PASSWORD'],
+                charset='utf8mb4', autocommit=False, connect_timeout=10)
+        return DBConnection(raw, DB_BACKEND)
+    except DatabaseError:
+        raise
+    except Exception as error:
+        raise DatabaseError('无法连接数据库。请检查 AERO_DB_* 配置、网络连通性和对应驱动。') from error
+
 
 def initialize():
-    DB.parent.mkdir(exist_ok=True)
+    if DB_BACKEND == 'sqlite':
+        schema = [
+            'CREATE TABLE IF NOT EXISTS assets(id INTEGER PRIMARY KEY, body TEXT NOT NULL)',
+            'CREATE TABLE IF NOT EXISTS templates(id INTEGER PRIMARY KEY, body TEXT NOT NULL)',
+            'CREATE TABLE IF NOT EXISTS history(id INTEGER PRIMARY KEY, created TEXT NOT NULL, body TEXT NOT NULL)',
+            'CREATE TABLE IF NOT EXISTS generation_records(id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL, created TEXT NOT NULL, body TEXT NOT NULL)',
+            'CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)',
+            "CREATE TABLE IF NOT EXISTS users(username TEXT PRIMARY KEY, display_name TEXT NOT NULL, salt TEXT NOT NULL, password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user')",
+        ]
+        meta_key = 'key'
+    elif DB_BACKEND == 'postgresql':
+        schema = [
+            'CREATE TABLE IF NOT EXISTS assets(id BIGINT PRIMARY KEY, body TEXT NOT NULL)',
+            'CREATE TABLE IF NOT EXISTS templates(id BIGINT PRIMARY KEY, body TEXT NOT NULL)',
+            'CREATE TABLE IF NOT EXISTS history(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, created TEXT NOT NULL, body TEXT NOT NULL)',
+            'CREATE TABLE IF NOT EXISTS generation_records(id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, username VARCHAR(100) NOT NULL, created TEXT NOT NULL, body TEXT NOT NULL)',
+            'CREATE TABLE IF NOT EXISTS meta(meta_key VARCHAR(100) PRIMARY KEY, value TEXT NOT NULL)',
+            "CREATE TABLE IF NOT EXISTS users(username VARCHAR(100) PRIMARY KEY, display_name VARCHAR(255) NOT NULL, salt CHAR(32) NOT NULL, password_hash CHAR(64) NOT NULL, role VARCHAR(20) NOT NULL DEFAULT 'user')",
+        ]
+        meta_key = 'meta_key'
+    else:
+        schema = [
+            'CREATE TABLE IF NOT EXISTS assets(id BIGINT PRIMARY KEY, body LONGTEXT NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4',
+            'CREATE TABLE IF NOT EXISTS templates(id BIGINT PRIMARY KEY, body LONGTEXT NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4',
+            'CREATE TABLE IF NOT EXISTS history(id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, created VARCHAR(40) NOT NULL, body LONGTEXT NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4',
+            'CREATE TABLE IF NOT EXISTS generation_records(id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY, username VARCHAR(100) NOT NULL, created VARCHAR(40) NOT NULL, body LONGTEXT NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4',
+            'CREATE TABLE IF NOT EXISTS meta(meta_key VARCHAR(100) PRIMARY KEY, value TEXT NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4',
+            "CREATE TABLE IF NOT EXISTS users(username VARCHAR(100) PRIMARY KEY, display_name VARCHAR(255) NOT NULL, salt CHAR(32) NOT NULL, password_hash CHAR(64) NOT NULL, role VARCHAR(20) NOT NULL DEFAULT 'user') ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        ]
+        meta_key = 'meta_key'
     with connect() as c:
-        c.executescript('''CREATE TABLE IF NOT EXISTS assets(id INTEGER PRIMARY KEY, body TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS templates(id INTEGER PRIMARY KEY, body TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS history(id INTEGER PRIMARY KEY, created TEXT NOT NULL, body TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS users(username TEXT PRIMARY KEY, display_name TEXT NOT NULL, salt TEXT NOT NULL, password_hash TEXT NOT NULL);''')
+        for statement in schema: c.execute(statement)
+        if DB_BACKEND == 'sqlite':
+            user_columns = {row[1] for row in c.execute('PRAGMA table_info(users)')}
+            if 'role' not in user_columns:
+                c.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user'")
+        elif DB_BACKEND == 'postgresql':
+            has_role = c.execute("SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='users' AND column_name='role'").fetchone()
+            if not has_role:
+                c.execute("ALTER TABLE users ADD COLUMN role VARCHAR(20) NOT NULL DEFAULT 'user'")
+        else:
+            has_role = c.execute("SELECT 1 FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='users' AND column_name='role'").fetchone()
+            if not has_role:
+                c.execute("ALTER TABLE users ADD COLUMN role VARCHAR(20) NOT NULL DEFAULT 'user'")
+        c.execute("UPDATE users SET role='admin' WHERE username='admin'")
         if not c.execute("SELECT 1 FROM users WHERE username='admin'").fetchone():
+            initial_password = os.environ.get('AERO_ADMIN_INITIAL_PASSWORD')
+            if DB_BACKEND != 'sqlite' and not initial_password:
+                raise RuntimeError('首次初始化 PostgreSQL/MySQL 时请设置 AERO_ADMIN_INITIAL_PASSWORD')
+            initial_password = initial_password or 'admin'
             salt = secrets.token_hex(16)
-            password_hash = hashlib.pbkdf2_hmac('sha256', b'admin', bytes.fromhex(salt), 200000).hex()
-            c.execute('INSERT INTO users VALUES(?,?,?,?)', ('admin', 'admin', salt, password_hash))
-        if not c.execute("SELECT 1 FROM meta WHERE key='initialized'").fetchone():
-            seed_file = BASE / 'seed.json'
-            if not seed_file.is_file(): seed_file = BASE / 'data' / 'seed.json'
-            seed = json.loads(seed_file.read_text(encoding='utf-8'))
-            write_state(c, seed)
+            password_hash = hashlib.pbkdf2_hmac('sha256', initial_password.encode('utf-8'), bytes.fromhex(salt), 200000).hex()
+            c.execute('INSERT INTO users(username,display_name,salt,password_hash,role) VALUES(?,?,?,?,?)', ('admin', 'admin', salt, password_hash, 'admin'))
+        admin_display = c.execute("SELECT display_name FROM users WHERE username='admin'").fetchone()[0]
+        known_owners = {row[0] for row in c.execute('SELECT display_name FROM users')}
+        for row in c.execute('SELECT id,body FROM assets').fetchall():
+            asset_id, body = row
+            asset = json.loads(body)
+            enrich_asset(asset)
+            if asset['owner'] == '待指定' or asset['owner'] not in known_owners:
+                asset['owner'] = admin_display
+            c.execute('UPDATE assets SET body=? WHERE id=?', (json.dumps(asset, ensure_ascii=False), asset_id))
+        if not c.execute("SELECT 1 FROM meta WHERE " + meta_key + "='initialized'").fetchone():
+            if DB_BACKEND == 'sqlite' or os.environ.get('AERO_LOAD_SEED') == '1':
+                seed_file = BASE / 'seed.json'
+                if not seed_file.is_file(): seed_file = BASE / 'data' / 'seed.json'
+                seed = json.loads(seed_file.read_text(encoding='utf-8'))
+                for asset in seed['assets']:
+                    asset.setdefault('owner', admin_display)
+                    enrich_asset(asset)
+                write_state(c, seed)
             c.execute("INSERT INTO meta VALUES('initialized','1')")
+
 
 def write_state(c, state):
     c.execute('DELETE FROM assets')
     c.execute('DELETE FROM templates')
     c.executemany('INSERT INTO assets VALUES(?,?)', [(r['id'], json.dumps(r, ensure_ascii=False)) for r in state['assets']])
     c.executemany('INSERT INTO templates VALUES(?,?)', [(i, json.dumps(t, ensure_ascii=False)) for i,t in enumerate(state['templates'])])
+
 
 def validate(s):
     if not isinstance(s,dict) or not isinstance(s.get('assets'),list) or not isinstance(s.get('templates'),list):
@@ -179,7 +303,9 @@ class AppServer(ThreadingHTTPServer):
 
 class Handler(BaseHTTPRequestHandler):
     def allowed_host(self):
-        return self.headers.get('Host') in ('127.0.0.1:'+str(self.server.server_port),'localhost:'+str(self.server.server_port))
+        hostname = urlparse('http://' + self.headers.get('Host', '')).hostname
+        allowed = getattr(self.server, 'allowed_hosts', {'127.0.0.1', 'localhost', '::1'})
+        return bool(hostname and hostname.lower() in allowed)
 
     def cookie_name(self):
         return 'aero_session_' + str(self.server.server_port)
@@ -191,12 +317,20 @@ class Handler(BaseHTTPRequestHandler):
         except CookieError:
             return ''
 
-    def current_user(self):
+    def current_identity(self):
         with self.server.session_lock:
             session = self.server.sessions.get(self.session_id())
             if session and session['expires'] > time.monotonic():
-                return session['user']
+                return dict(session)
         return None
+
+    def current_user(self):
+        identity = self.current_identity()
+        return identity.get('user') if identity else None
+
+    def current_role(self):
+        identity = self.current_identity()
+        return identity.get('role', 'user') if identity else None
 
     def reply(self, status, data, cookie=None):
         raw=json.dumps(data,ensure_ascii=False).encode('utf-8')
@@ -214,7 +348,7 @@ class Handler(BaseHTTPRequestHandler):
         if path in ('/', '/index.html', '/web/index.html'):
             index = BASE / 'index.html'
             if not index.is_file(): index = BASE / 'web' / 'index.html'
-            raw = index.read_bytes()
+            raw = index.read_text(encoding='utf-8').replace('数据库类型由服务端配置', DB_LABEL).encode('utf-8')
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
             self.send_header('Content-Length', str(len(raw)))
@@ -226,7 +360,7 @@ class Handler(BaseHTTPRequestHandler):
             if not self.current_user(): return self.reply(401, {'error':'请先登录'})
             if path == '/api/backup.csv':
                 with connect() as c:
-                    assets = [json.loads(row[0]) for row in c.execute('SELECT body FROM assets ORDER BY rowid')]
+                    assets = [json.loads(row[0]) for row in c.execute('SELECT body FROM assets ORDER BY id')]
                 text = csv_text(assets)
             else:
                 text = '\ufeff' + ','.join(label for label, key in CSV_FIELDS) + '\r\n'
@@ -237,30 +371,54 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header('Content-Length', str(len(raw)))
             self.send_header('Cache-Control', 'no-store')
             self.end_headers();self.wfile.write(raw);return
-        if path in ('/api/state', '/api/session'):
-            user = self.current_user()
-            if not user: return self.reply(401, {'error': '请先登录'})
-            if path == '/api/session': return self.reply(200, {'user': user, 'token': TOKEN})
+        if path in ('/api/generations', '/api/template-records'):
+            identity = self.current_identity()
+            if not identity: return self.reply(401, {'error': '请先登录'})
             with connect() as c:
-                s={'assets':[json.loads(r[0]) for r in c.execute('SELECT body FROM assets ORDER BY rowid')],
+                if path == '/api/generations':
+                    rows = c.execute('SELECT id,created,body FROM generation_records WHERE username=? ORDER BY id DESC LIMIT 100', (identity.get('username'),))
+                    records = []
+                    for row in rows:
+                        item = json.loads(row[2]); item.update({'id': row[0], 'created': row[1]}); records.append(item)
+                    return self.reply(200, {'records': records})
+                templates = [json.loads(row[0]) for row in c.execute('SELECT body FROM templates ORDER BY id')]
+            own = [t for t in templates if t.get('created_by_username') == identity.get('username')]
+            return self.reply(200, {'records': own})
+        if path == '/api/users':
+            identity = self.current_identity()
+            if not identity: return self.reply(401, {'error': '请先登录'})
+            if identity.get('role') != 'admin': return self.reply(403, {'error': '仅管理员可维护账号'})
+            with connect() as c:
+                users = [{'username': row[0], 'display_name': row[1], 'role': row[2]}
+                         for row in c.execute('SELECT username,display_name,role FROM users ORDER BY username')]
+            return self.reply(200, {'users': users})
+        if path in ('/api/state', '/api/session'):
+            identity = self.current_identity()
+            user = identity.get('user') if identity else None
+            if not user: return self.reply(401, {'error': '请先登录'})
+            if path == '/api/session': return self.reply(200, {'user': user, 'username': identity.get('username'), 'role': identity.get('role'), 'token': TOKEN})
+            with connect() as c:
+                s={'assets':[json.loads(r[0]) for r in c.execute('SELECT body FROM assets ORDER BY id')],
                    'templates':[json.loads(r[0]) for r in c.execute('SELECT body FROM templates ORDER BY id')]}
             for asset in s['assets']: enrich_asset(asset)
             for template in s['templates']:
                 template.setdefault('scenario', '')
                 template.setdefault('content_tags', [])
-            s['token']=TOKEN
+            s.update({'token': TOKEN, 'username': identity.get('username'), 'user': user, 'role': identity.get('role')})
             return self.reply(200,s)
         return self.reply(404, {'error': '接口或文件不存在'})
 
     def do_POST(self):
         if not self.allowed_host(): return self.reply(403, {'error': '仅允许本机访问'})
         origin = self.headers.get('Origin')
-        if origin and origin != 'http://' + self.headers.get('Host', ''):
+        if origin and origin != APP_PUBLIC_SCHEME + '://' + self.headers.get('Host', ''):
             return self.reply(403, {'error': '请求来源无效'})
         path = urlparse(self.path).path
-        if path not in ('/api/login', '/api/logout', '/api/state', '/api/tag', '/api/csv/preview', '/api/restore'):
+        if path not in ('/api/login', '/api/logout', '/api/state', '/api/tag', '/api/csv/preview', '/api/restore', '/api/users', '/api/generations'):
             return self.reply(404, {'error': '接口不存在'})
-        user = self.current_user()
+        identity = self.current_identity()
+        user = identity.get('user') if identity else None
+        role = identity.get('role', 'user') if identity else None
         if path != '/api/login':
             if not user: return self.reply(401, {'error': '请先登录'})
             if self.headers.get('X-Local-Token') != TOKEN:
@@ -275,7 +433,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(username, str) or not isinstance(password, str) or len(username)>50 or len(password)>256:
                     return self.reply(401, {'error': '账号或密码错误'})
                 with connect() as c:
-                    row = c.execute('SELECT display_name,salt,password_hash FROM users WHERE username=?', (username,)).fetchone()
+                    row = c.execute('SELECT display_name,salt,password_hash,role FROM users WHERE username=?', (username,)).fetchone()
                 salt = row[1] if row else '0' * 32
                 digest = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), bytes.fromhex(salt), 200000).hex()
                 if not row or not secrets.compare_digest(digest, row[2]):
@@ -285,14 +443,77 @@ class Handler(BaseHTTPRequestHandler):
                     now = time.monotonic()
                     self.server.sessions = {k:v for k,v in self.server.sessions.items() if v['expires'] > now}
                     self.server.sessions.pop(self.session_id(), None)
-                    self.server.sessions[sid] = {'user': row[0], 'expires': now + 12*60*60}
-                cookie = self.cookie_name() + '=' + sid + '; HttpOnly; SameSite=Strict; Path=/'
-                return self.reply(200, {'user': row[0], 'token': TOKEN}, cookie)
+                    self.server.sessions[sid] = {'user': row[0], 'username': username, 'role': row[3], 'expires': now + 12*60*60}
+                cookie = self.cookie_name() + '=' + sid + '; HttpOnly; SameSite=Strict; Path=/' + ('; Secure' if APP_PUBLIC_SCHEME == 'https' else '')
+                return self.reply(200, {'user': row[0], 'username': username, 'role': row[3], 'token': TOKEN}, cookie)
             if path == '/api/logout':
                 with self.server.session_lock: self.server.sessions.pop(self.session_id(), None)
-                return self.reply(200, {'logged_out': True}, self.cookie_name() + '=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0')
+                return self.reply(200, {'logged_out': True}, self.cookie_name() + '=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0' + ('; Secure' if APP_PUBLIC_SCHEME == 'https' else ''))
+            if path == '/api/generations':
+                if not isinstance(state, dict): raise ValueError('生成记录格式错误')
+                for key in ('topic', 'audience', 'requirements', 'draft'):
+                    if not isinstance(state.get(key), str): raise ValueError('生成记录缺少必要字段')
+                if not isinstance(state.get('template'), dict) or not isinstance(state.get('evidence'), list):
+                    raise ValueError('生成记录中的模板或素材格式错误')
+                created = datetime.now().isoformat(timespec='seconds')
+                body = json.dumps(state, ensure_ascii=False)
+                with connect() as c:
+                    c.execute('INSERT INTO generation_records(username,created,body) VALUES(?,?,?)',
+                              (identity.get('username'), created, body))
+                return self.reply(200, {'saved': True, 'created': created})
+            if path == '/api/users':
+                if role != 'admin': return self.reply(403, {'error': '仅管理员可维护账号'})
+                if not isinstance(state, dict): raise ValueError('账号操作格式错误')
+                action = state.get('action')
+                if action not in ('add', 'reset', 'delete'): raise ValueError('未知账号操作')
+                username = state.get('username')
+                if not isinstance(username, str) or not username.strip() or len(username) > 50 or any(ch.isspace() for ch in username):
+                    raise ValueError('账号须为1至50位且不能包含空格')
+                username = username.strip()
+                with connect() as c:
+                    row = c.execute('SELECT display_name,role FROM users WHERE username=?', (username,)).fetchone()
+                    if action == 'add':
+                        display_name = state.get('display_name')
+                        password = state.get('password')
+                        if not isinstance(display_name, str) or not display_name.strip() or len(display_name.strip()) > 50:
+                            raise ValueError('显示名称须为1至50个字符')
+                        if not isinstance(password, str) or len(password) < 8 or len(password) > 256:
+                            raise ValueError('密码长度须为8至256位')
+                        if row: raise ValueError('该账号已存在')
+                        if c.execute('SELECT 1 FROM users WHERE display_name=?', (display_name.strip(),)).fetchone():
+                            raise ValueError('显示名称已被使用，请保持负责人名称唯一')
+                        salt = secrets.token_hex(16)
+                        password_hash = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), bytes.fromhex(salt), 200000).hex()
+                        c.execute('INSERT INTO users(username,display_name,salt,password_hash,role) VALUES(?,?,?,?,?)',
+                                  (username, display_name.strip(), salt, password_hash, 'user'))
+                        return self.reply(200, {'saved': True})
+                    if not row: return self.reply(404, {'error': '账号不存在'})
+                    if action == 'reset':
+                        password = state.get('password')
+                        if not isinstance(password, str) or len(password) < 8 or len(password) > 256:
+                            raise ValueError('新密码长度须为8至256位')
+                        salt = secrets.token_hex(16)
+                        password_hash = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), bytes.fromhex(salt), 200000).hex()
+                        c.execute('UPDATE users SET salt=?,password_hash=? WHERE username=?', (salt,password_hash,username))
+                        if username != identity.get('username'):
+                            with self.server.session_lock:
+                                self.server.sessions = {sid: session for sid, session in self.server.sessions.items()
+                                                        if session.get('username') != username}
+                        return self.reply(200, {'saved': True})
+                    if username == 'admin' or row[1] == 'admin': return self.reply(400, {'error': '不能删除管理员账号'})
+                    for asset_row in c.execute('SELECT body FROM assets'):
+                        asset = json.loads(asset_row[0])
+                        if asset.get('owner') == row[0]:
+                            return self.reply(400, {'error': '该账号仍负责素材，请先处理其名下素材再删除账号'})
+                    c.execute('DELETE FROM users WHERE username=?', (username,))
+                with self.server.session_lock:
+                    self.server.sessions = {sid: session for sid, session in self.server.sessions.items()
+                                            if session.get('username') != username}
+                return self.reply(200, {'deleted': True})
             if path == '/api/csv/preview':
                 if not isinstance(state, dict): raise ValueError('CSV格式错误')
+                if state.get('restore') is True and role != 'admin':
+                    return self.reply(403, {'error': '仅管理员可预览并恢复完整备份'})
                 with connect() as c:
                     ids = [row[0] for row in c.execute('SELECT id FROM assets')]
                 assets = parse_asset_csv(state.get('csv'), user, ids, restore=state.get('restore') is True)
@@ -306,50 +527,88 @@ class Handler(BaseHTTPRequestHandler):
             with connect() as c:
                 old={'assets':[json.loads(r[0]) for r in c.execute('SELECT body FROM assets')],
                      'templates':[json.loads(r[0]) for r in c.execute('SELECT body FROM templates ORDER BY id')]}
+                if path == '/api/restore' and role != 'admin':
+                    return self.reply(403, {'error': '仅管理员可恢复完整备份'})
                 existing = {r['id']: r for r in old['assets']}
+                submitted = {}
                 for asset in state['assets']:
                     if not isinstance(asset, dict): raise ValueError('资产格式错误')
-                    prior = existing.get(asset.get('id'))
-                    if path == '/api/restore':
-                        asset.setdefault('owner', '待指定')
-                    elif prior and prior.get('owner') not in (None, '', '待指定'):
-                        asset['owner'] = prior['owner']
-                    elif prior:
-                        asset['owner'] = user if asset.get('owner') == user else '待指定'
+                    asset_id = asset.get('id')
+                    if asset_id in submitted: raise ValueError('资产编号重复')
+                    submitted[asset_id] = asset
+                merged_assets = []
+                for asset_id, asset in submitted.items():
+                    prior = existing.get(asset_id)
+                    if prior:
+                        canonical_prior = dict(prior)
+                        enrich_asset(canonical_prior)
+                        if canonical_prior['owner'] != user:
+                            if json.dumps(asset, ensure_ascii=False, sort_keys=True) != json.dumps(canonical_prior, ensure_ascii=False, sort_keys=True):
+                                return self.reply(403, {'error': '只能修改或删除自己负责的素材'})
+                            merged_assets.append(canonical_prior)
+                        else:
+                            asset['owner'] = user
+                            enrich_asset(asset)
+                            merged_assets.append(asset)
                     else:
                         asset['owner'] = user
-                    enrich_asset(asset)
+                        enrich_asset(asset)
+                        merged_assets.append(asset)
+                for asset_id, prior in existing.items():
+                    if asset_id in submitted: continue
+                    canonical_prior = dict(prior)
+                    enrich_asset(canonical_prior)
+                    if canonical_prior['owner'] != user:
+                        merged_assets.append(canonical_prior)
+                state['assets'] = merged_assets
+                for index, template in enumerate(state.get('templates', [])):
+                    if not isinstance(template, dict): raise ValueError('模板格式错误')
+                    if index < len(old['templates']):
+                        prior_template = old['templates'][index]
+                        for key in ('created_by_username', 'created_by_name', 'created_at'):
+                            if key in prior_template: template[key] = prior_template[key]
+                            else: template.pop(key, None)
+                    else:
+                        template['created_by_username'] = identity.get('username')
+                        template['created_by_name'] = user
+                        template['created_at'] = datetime.now().isoformat(timespec='seconds')
                 validate(state)
                 c.execute('INSERT INTO history(created,body) VALUES(?,?)',(datetime.now().isoformat(),json.dumps(old,ensure_ascii=False)))
                 write_state(c,state)
             return self.reply(200,{'saved':True})
-        except (ValueError,KeyError,TypeError,sqlite3.Error,csv.Error) as e:
+        except (ValueError,KeyError,TypeError,sqlite3.Error,DatabaseError,csv.Error) as e:
             return self.reply(400,{'error':str(e)})
 
 def main():
-    p=argparse.ArgumentParser()
+    p = argparse.ArgumentParser()
     p.add_argument('--port', type=int, default=None)
     p.add_argument('--no-browser', action='store_true')
-    a=p.parse_args()
-    ports = [a.port] if a.port is not None else range(8000, 8011)
-    server = None
-    for port in ports:
-        try:
-            server = AppServer(('127.0.0.1', port), Handler)
-            break
-        except OSError as error:
-            if error.errno not in (errno.EADDRINUSE, getattr(errno, 'WSAEADDRINUSE', 10048)) or a.port is not None:
-                p.exit(1, 'Port unavailable. Close the old service or try --port 8001.\n')
-    if server is None: p.exit(1, 'Ports 8000-8010 unavailable. Close the old service.\n')
+    a = p.parse_args()
+    bind_host = os.environ.get('AERO_APP_BIND_HOST', '127.0.0.1')
+    configured_port = a.port if a.port is not None else int(os.environ.get('AERO_APP_PORT', '8000'))
+    allowed_hosts = {item.strip().lower() for item in os.environ.get(
+        'AERO_ALLOWED_HOSTS', '127.0.0.1,localhost,::1').split(',') if item.strip()}
+    if bind_host not in ('0.0.0.0', '::'): allowed_hosts.add(bind_host.lower())
+    AppServer.allowed_hosts = allowed_hosts
     try:
         initialize()
-    except Exception:
-        server.server_close()
-        raise
-    url='http://127.0.0.1:'+str(server.server_port)+'/?login=1'
-    print('Offline knowledge workbench v1.2: '+url+'\nKeep this window open. Ctrl+C to stop.\nDatabase: '+str(DB))
-    if not a.no_browser: threading.Timer(.5,lambda:webbrowser.open(url)).start()
-    try:server.serve_forever()
-    except KeyboardInterrupt:pass
-    finally:server.server_close()
-if __name__=='__main__':main()
+    except Exception as error:
+        p.exit(1, str(error) + '\n')
+    try:
+        server = AppServer((bind_host, configured_port), Handler)
+    except OSError:
+        p.exit(1, '服务监听失败，请检查 AERO_APP_BIND_HOST / AERO_APP_PORT 和端口占用。\n')
+    display_host = bind_host if bind_host not in ('0.0.0.0', '::') else '127.0.0.1'
+    url = 'http://' + display_host + ':' + str(server.server_port) + '/?login=1'
+    print('Aero strategy knowledge workbench: ' + url)
+    print('Backend: ' + DB_LABEL)
+    print('For LAN access, use the server LAN address and add its host/IP to AERO_ALLOWED_HOSTS.')
+    print('Keep this window open. Ctrl+C to stop.')
+    if DB_BACKEND == 'sqlite': print('Database: ' + str(DB))
+    if not a.no_browser and bind_host in ('127.0.0.1', 'localhost', '::1'):
+        threading.Timer(.5, lambda: webbrowser.open(url)).start()
+    try: server.serve_forever()
+    except KeyboardInterrupt: pass
+    finally: server.server_close()
+
+if __name__ == '__main__': main()
