@@ -80,4 +80,4 @@ python -m unittest discover -s tests -v
 python tools/build_offline_package.py --output-dir ./dist
 ```
 
-打包脚本生成不含数据库密码和本地数据的 v1.3 ZIP。该 ZIP 仅包含程序文件与驱动安装说明；数据库驱动需按目标环境准备离线 wheelhouse。现有 v1.2 ZIP 保留作为 SQLite 单机版本归档。
+打包脚本生成不含数据库密码和本地数据的 V2 ZIP，包含当前分支最新界面、账号权限、报告生成记录、模板编辑和离线数据库配置。数据库驱动需按目标环境准备离线 wheelhouse；现有 v1.2 ZIP 保留作为 SQLite 单机版本归档。
